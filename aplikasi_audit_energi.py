@@ -4,6 +4,8 @@
 # ============================================================
 import streamlit as st
 import pandas as pd
+from io import BytesIO
+from datetime import datetime
 
 # ---------- KONFIGURASI HALAMAN ----------
 st.set_page_config(
@@ -169,16 +171,11 @@ if st.session_state.data_alat:
     df = pd.DataFrame(rows)
 
     # ---------- SORTIR 3 TINGKAT ----------
-    # 1. Nama Alat (A → Z)
-    # 2. Jam/hari (besar → kecil)
-    # 3. Biaya Tahunan (besar → kecil)
     df_sorted = df.sort_values(
         by=["Nama Alat", "Jam/hari", "Biaya Tahunan (Rp)"],
         ascending=[True, False, False],
         kind="mergesort"
     ).reset_index(drop=True)
-
-    # ---------- INSERT "No" SETELAH SORTIR ----------
     df_sorted.insert(0, "No", range(1, len(df_sorted) + 1))
 
     # ---------- TAMPILKAN ----------
@@ -219,8 +216,10 @@ if st.session_state.data_alat:
     # ============================================================
     st.subheader("📊 Total Keseluruhan")
 
+    total_energi_harian = sum(r["Energi Harian (kWh)"] for r in rows)
     total_energi_bulanan = sum(r["Energi Bulanan (kWh)"] for r in rows)
     total_energi_tahunan = sum(r["Energi Tahunan (kWh)"] for r in rows)
+    total_biaya_harian = sum(r["Biaya Harian (Rp)"] for r in rows)
     total_biaya_bulanan = sum(r["Biaya Bulanan (Rp)"] for r in rows)
     total_biaya_tahunan = sum(r["Biaya Tahunan (Rp)"] for r in rows)
     total_daya = sum(r["Daya Total (W)"] for r in rows)
@@ -254,8 +253,10 @@ if st.session_state.data_alat:
         st.progress(persen)
 
         if total_daya <= batas_aman:
+            status_kapasitas = "AMAN"
             st.success(f"✅ **AMAN** — Total daya terpakai {format_watt(total_daya)} masih dalam batas aman {format_watt(batas_aman)}.")
         else:
+            status_kapasitas = "TIDAK CUKUP"
             kelebihan = total_daya - batas_aman
             st.error(
                 f"❌ **KAPASITAS AMPERE RUMAH TIDAK CUKUP**\n\n"
@@ -265,25 +266,158 @@ if st.session_state.data_alat:
                 f"💡 Saran: Naikkan kapasitas MCB rumah atau kurangi pemakaian alat."
             )
     else:
+        status_kapasitas = "Belum diisi"
+        kapasitas_max = 0
+        batas_aman = 0
         st.warning("⚠️ Isi **Kapasitas Rumah (Ampere)** di sidebar untuk mengecek status keamanan.")
 
     st.divider()
 
     # ============================================================
-    # EXPORT CSV
+    # EXPORT DATA (CSV + EXCEL)
     # ============================================================
     st.subheader("📥 Export Data")
-    st.caption("File CSV mengikuti urutan sortir yang sedang aktif.")
 
+    # ---------- Tanggal untuk nama file ----------
+    tanggal_hari_ini = datetime.now().strftime("%Y%m%d")
+
+    # ---------- CSV (tetap ada) ----------
     csv = df_sorted.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
 
-    st.download_button(
-        label="⬇️ Download CSV (Excel-friendly)",
-        data=csv,
-        file_name="audit_energi_listrik.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
+    # ---------- EXCEL (3 sheet) ----------
+    def buat_excel():
+        """Generate file Excel multi-sheet."""
+        buffer = BytesIO()
+
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            wb = writer.book
+
+            # ============ SHEET 1: Daftar Alat ============
+            ws1 = wb.create_sheet("Daftar Alat")
+            ws1["A1"] = "LAPORAN AUDIT ENERGI LISTRIK RUMAH TANGGA"
+            ws1["A1"].font = ws1["A1"].font.copy(bold=True, size=14)
+            ws1["A2"] = f"Tanggal: {datetime.now().strftime('%d/%m/%Y')}"
+            ws1["A2"].font = ws1["A2"].font.copy(italic=True, size=10)
+            ws1["A3"] = f"Tarif: {format_rupiah(TARIF_PER_KWH)}/kWh"
+
+            # Tulis tabel mulai baris 5
+            df_sorted.to_excel(writer, sheet_name="Daftar Alat", startrow=4, index=False, header=True)
+
+            # Style header kolom
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+            header_fill = PatternFill(start_color="FF4B4B", end_color="FF4B4B", fill_type="solid")
+            header_font = Font(bold=True, color="FFFFFF")
+            border = Border(
+                left=Side(style="thin"),
+                right=Side(style="thin"),
+                top=Side(style="thin"),
+                bottom=Side(style="thin")
+            )
+
+            # Baris header tabel ada di baris ke-5
+            for cell in ws1[5]:
+                if cell.value:
+                    cell.fill = header_fill
+                    cell.font = header_font
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    cell.border = border
+
+            # Auto-width kolom
+            for col_idx, col_name in enumerate(df_sorted.columns, 1):
+                max_length = len(str(col_name))
+                for row_idx in range(len(df_sorted)):
+                    val = str(df_sorted.iloc[row_idx][col_name])
+                    if len(val) > max_length:
+                        max_length = len(val)
+                ws1.column_dimensions[
+                    ws1.cell(row=5, column=col_idx).column_letter
+                ].width = min(max_length + 3, 25)
+
+            # ============ SHEET 2: Total Keseluruhan ============
+            ws2 = wb.create_sheet("Total Keseluruhan")
+            ws2["A1"] = "TOTAL KESELURUHAN"
+            ws2["A1"].font = ws2["A1"].font.copy(bold=True, size=14)
+
+            total_data = [
+                ("Total Daya Terpakai", format_watt(total_daya)),
+                ("", ""),
+                ("Total Energi Harian", format_kwh(total_energi_harian)),
+                ("Total Energi Bulanan", format_kwh(total_energi_bulanan)),
+                ("Total Energi Tahunan", format_kwh(total_energi_tahunan)),
+                ("", ""),
+                ("Total Biaya Harian", format_rupiah(total_biaya_harian)),
+                ("Total Biaya Bulanan", format_rupiah(total_biaya_bulanan)),
+                ("Total Biaya Tahunan", format_rupiah(total_biaya_tahunan)),
+            ]
+
+            for i, (label, value) in enumerate(total_data, start=3):
+                ws2.cell(row=i, column=1, value=label).font = Font(bold=True)
+                ws2.cell(row=i, column=2, value=value)
+
+            ws2.column_dimensions["A"].width = 30
+            ws2.column_dimensions["B"].width = 25
+
+            # ============ SHEET 3: Cek Kapasitas Rumah ============
+            ws3 = wb.create_sheet("Cek Kapasitas Rumah")
+            ws3["A1"] = "CEK KAPASITAS RUMAH"
+            ws3["A1"].font = ws3["A1"].font.copy(bold=True, size=14)
+
+            sisa_kapasitas = batas_aman - total_daya
+            sisa_str = format_watt(sisa_kapasitas) if sisa_kapasitas >= 0 else f"-{format_watt(abs(sisa_kapasitas))}"
+
+            kapasitas_data = [
+                ("Kapasitas Rumah", f"{kapasitas_ampere:g} A"),
+                ("Tegangan", f"{TEGANGAN} V"),
+                ("Kapasitas Maksimal", format_watt(kapasitas_max)),
+                ("Batas Aman (80%)", format_watt(batas_aman)),
+                ("Total Daya Terpakai", format_watt(total_daya)),
+                ("Sisa Kapasitas", sisa_str),
+                ("", ""),
+                ("STATUS", status_kapasitas),
+            ]
+
+            for i, (label, value) in enumerate(kapasitas_data, start=3):
+                cell_label = ws3.cell(row=i, column=1, value=label)
+                cell_value = ws3.cell(row=i, column=2, value=value)
+                cell_label.font = Font(bold=True)
+
+                # Warna status
+                if label == "STATUS":
+                    if value == "AMAN":
+                        cell_value.font = Font(bold=True, color="00AA00", size=12)
+                    elif value == "TIDAK CUKUP":
+                        cell_value.font = Font(bold=True, color="CC0000", size=12)
+
+            ws3.column_dimensions["A"].width = 30
+            ws3.column_dimensions["B"].width = 25
+
+        buffer.seek(0)
+        return buffer.getvalue()
+
+    # ---------- Tombol Download ----------
+    col_dl1, col_dl2 = st.columns(2)
+
+    with col_dl1:
+        st.download_button(
+            label="⬇️ Download CSV (Excel-friendly)",
+            data=csv,
+            file_name=f"audit_energi_{tanggal_hari_ini}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+    with col_dl2:
+        excel_data = buat_excel()
+        st.download_button(
+            label="⬇️ Download Excel (Laporan Lengkap)",
+            data=excel_data,
+            file_name=f"audit_energi_{tanggal_hari_ini}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+
+    st.caption("📄 File Excel berisi 3 sheet: **Daftar Alat**, **Total Keseluruhan**, **Cek Kapasitas Rumah**")
 
 else:
     st.info("📭 Belum ada alat. Silakan tambahkan alat melalui form di atas.")
